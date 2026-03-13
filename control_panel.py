@@ -22,6 +22,8 @@ LOG_TOP_Y = 176
 LOG_BOTTOM_MARGIN = 24
 PENDING_REFRESH_SEC = 0.8
 SERVERS_REFRESH_SEC = 0.8
+SERVERS_WINDOW_MS = 3000
+BLINK_PULSE_MS = 500
 
 COLORS = {
     "bg_top": (16, 22, 28),
@@ -168,7 +170,11 @@ def read_local_servers(path):
         return [], None, str(err)
 
 def clear_local_servers(path):
-    payload = {"updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "windowMs": 5000, "servers": []}
+    payload = {
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "windowMs": SERVERS_WINDOW_MS,
+        "servers": [],
+    }
     try:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -192,6 +198,65 @@ def latest_last_seen(servers_list):
             if isinstance(last_seen, (int, float)):
                 latest = last_seen if latest is None else max(latest, last_seen)
     return latest
+
+def build_endpoint_tree(endpoints):
+    root = {"children": {}, "lastSend": 0, "isEndpoint": False}
+    for endpoint in endpoints:
+        path = endpoint.get("endpoint") or ""
+        last_send = endpoint.get("lastSend") or 0
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            parts = ["(root)"]
+        node = root
+        for part in parts:
+            if part not in node["children"]:
+                node["children"][part] = {"children": {}, "lastSend": 0, "isEndpoint": False}
+            node = node["children"][part]
+        node["lastSend"] = max(node["lastSend"], last_send)
+        node["isEndpoint"] = True
+    return root
+
+def flatten_endpoint_tree(node, depth, rows, prefix, ip):
+    for name in sorted(node["children"].keys()):
+        child = node["children"][name]
+        has_children = len(child["children"]) > 0
+        full_path = name if not prefix else f"{prefix}/{name}"
+        rows.append(
+            {
+                "type": "node",
+                "text": name,
+                "depth": depth,
+                "path": full_path,
+                "ip": ip,
+                "lastSend": child.get("lastSend", 0),
+                "isEndpoint": child.get("isEndpoint", False),
+                "hasChildren": has_children,
+            }
+        )
+        flatten_endpoint_tree(child, depth + 1, rows, full_path, ip)
+
+def build_server_rows(servers_items, servers_expanded):
+    rows = []
+    for server in servers_items:
+        ip = server.get("ip", "-")
+        rows.append({"type": "ip", "ip": ip, "text": f"IP: {ip}"})
+        if not servers_expanded.get(ip, True):
+            continue
+        endpoints = server.get("endpoints", [])
+        if not endpoints:
+            rows.append(
+                {
+                    "type": "node",
+                    "text": "(no endpoints)",
+                    "depth": 0,
+                    "lastSend": 0,
+                    "isLeaf": True,
+                }
+            )
+            continue
+        tree = build_endpoint_tree(endpoints)
+        flatten_endpoint_tree(tree, 0, rows, "", ip)
+    return rows
 
 def draw_vertical_gradient(surface, rect, top_color, bottom_color):
     x, y, w, h = rect
@@ -242,6 +307,9 @@ def main():
     servers_total_rows = 0
     servers_cache = []
     servers_empty_streak = 0
+    servers_rows = []
+    servers_last_send_seen = {}
+    servers_blink_until = {}
     servers_expanded = {}
     servers_header_rects = []
 
@@ -358,7 +426,7 @@ def main():
                 else:
                     servers_empty_streak += 1
                     cached_latest = latest_last_seen(servers_cache)
-                    if cached_latest and (time.time() * 1000 - cached_latest) <= 5000:
+                    if cached_latest and (time.time() * 1000 - cached_latest) <= SERVERS_WINDOW_MS:
                         if servers_empty_streak < 2:
                             servers_items = servers_cache
                         else:
@@ -369,12 +437,8 @@ def main():
                     ip = server.get("ip")
                     if ip and ip not in servers_expanded:
                         servers_expanded[ip] = True
-            servers_total_rows = 0
-            for server in servers_items:
-                servers_total_rows += 1
-                endpoints = server.get("endpoints", [])
-                if servers_expanded.get(server.get("ip", "-"), True):
-                    servers_total_rows += max(1, len(endpoints))
+            servers_rows = build_server_rows(servers_items, servers_expanded)
+            servers_total_rows = len(servers_rows)
             max_servers_offset = max(0, servers_total_rows - visible_lines)
             servers_scroll_offset = max(0, min(servers_scroll_offset, max_servers_offset))
 
@@ -396,6 +460,8 @@ def main():
             servers_header_rects = []
             servers_cache = []
             servers_empty_streak = 0
+            servers_last_send_seen = {}
+            servers_blink_until = {}
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -423,6 +489,8 @@ def main():
                         clear_local_servers(local_servers_path)
                         servers_cache = []
                         servers_empty_streak = 0
+                        servers_last_send_seen = {}
+                        servers_blink_until = {}
                     elif validate_port(port_input):
                         process = start_process(port_input, log_queue, project_dir)
                         running_port = port_input
@@ -448,6 +516,8 @@ def main():
                     clear_local_servers(local_servers_path)
                     servers_cache = []
                     servers_empty_streak = 0
+                    servers_last_send_seen = {}
+                    servers_blink_until = {}
 
                 if clear_button.hit(event.pos):
                     log_lines.clear()
@@ -468,6 +538,7 @@ def main():
                     if servers_items:
                         servers_cache = servers_items
                         servers_empty_streak = 0
+                        servers_rows = build_server_rows(servers_items, servers_expanded)
 
                 if active_tab == "logs" and not log_follow and bottom_button.hit(event.pos):
                     log_follow = True
@@ -642,7 +713,7 @@ def main():
                 pending_cancel_rects.append((cancel_rect, entry.get("id", "")))
                 y += LOG_LINE_HEIGHT
         else:
-            servers_title = ui_font.render("Servers (Last 5s)", True, COLORS["text"])
+            servers_title = ui_font.render("Servers (Last 3s)", True, COLORS["text"])
             screen.blit(servers_title, (log_area.x + 8, log_area.y + 6))
 
             status_line = "Last update: " + (servers_last_update or "-")
@@ -656,31 +727,33 @@ def main():
 
             if not servers_items:
                 empty = ui_font.render(
-                    "No server activity in the last 5 seconds.",
+                    "No server activity in the last 3 seconds.",
                     True,
                     COLORS["muted"],
                 )
                 screen.blit(empty, (log_area.x + LOG_PADDING, log_area.y + 84))
-                rows = []
-            else:
-                rows = []
-            for server in servers_items:
-                ip = server.get("ip", "-")
-                endpoints = server.get("endpoints", [])
-                rows.append({"type": "ip", "ip": ip, "text": ip})
-                if servers_expanded.get(ip, True):
-                    if not endpoints:
-                        rows.append({"type": "endpoint", "text": "-"})
-                    else:
-                        for endpoint in endpoints:
-                            ep = endpoint.get("endpoint") or "-"
-                            rows.append({"type": "endpoint", "text": ep})
+                servers_header_rects = []
+                pygame.display.flip()
+                clock.tick(60)
+                continue
 
-            max_servers_offset = max(0, len(rows) - visible_lines)
-            servers_scroll_offset = max(0, min(servers_scroll_offset, max_servers_offset))
+            if not servers_rows:
+                servers_rows = build_server_rows(servers_items, servers_expanded)
 
-            start_index = max(0, len(rows) - visible_lines - servers_scroll_offset)
-            visible = rows[start_index : start_index + visible_lines]
+            now_ms = time.time() * 1000
+            for row in servers_rows:
+                if row.get("type") != "node":
+                    continue
+                if not row.get("isEndpoint"):
+                    continue
+                key = f"{row.get('ip')}|{row.get('path')}"
+                last_send = row.get("lastSend", 0)
+                if last_send and last_send > servers_last_send_seen.get(key, 0):
+                    servers_last_send_seen[key] = last_send
+                    servers_blink_until[key] = now_ms + BLINK_PULSE_MS
+
+            start_index = max(0, len(servers_rows) - visible_lines - servers_scroll_offset)
+            visible = servers_rows[start_index : start_index + visible_lines]
             y = log_area.y + 80
             servers_header_rects = []
             for item in visible:
@@ -713,26 +786,38 @@ def main():
                     servers_header_rects.append((header_rect, item["ip"]))
                     y += LOG_LINE_HEIGHT + 4
                 else:
+                    indent = 18 * item["depth"]
                     pill_rect = pygame.Rect(
-                        log_area.x + LOG_PADDING + 16,
+                        log_area.x + LOG_PADDING + 16 + indent,
                         y - 2,
-                        log_area.width - LOG_PADDING * 2 - 30,
+                        log_area.width - LOG_PADDING * 2 - 30 - indent,
                         LOG_LINE_HEIGHT + 2,
                     )
+                    key = f"{item.get('ip')}|{item.get('path')}"
+                    is_recent_send = now_ms < servers_blink_until.get(key, 0)
+
+                    base_color = (32, 40, 52)
+                    border_color = (55, 70, 92)
+                    text_color = (180, 210, 240)
+                    if is_recent_send:
+                        base_color = (60, 120, 200)
+                        border_color = (90, 150, 220)
+                        text_color = (235, 245, 255)
+
                     pygame.draw.rect(
                         screen,
-                        (32, 40, 52),
+                        base_color,
                         pill_rect,
                         border_radius=6,
                     )
                     pygame.draw.rect(
                         screen,
-                        (55, 70, 92),
+                        border_color,
                         pill_rect,
                         1,
                         border_radius=6,
                     )
-                    ep_text = mono_font.render(item["text"], True, (180, 210, 240))
+                    ep_text = mono_font.render(item["text"], True, text_color)
                     screen.blit(ep_text, (pill_rect.x + 8, pill_rect.y + 2))
                     y += LOG_LINE_HEIGHT + 2
 

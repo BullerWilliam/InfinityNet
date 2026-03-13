@@ -15,7 +15,7 @@ const LOCAL_PENDING_PATH = path.join(__dirname, "local_pending.json");
 const LOCAL_CANCEL_PATH = path.join(__dirname, "local_cancel.jsonl");
 const LOCAL_CANCEL_TMP = `${LOCAL_CANCEL_PATH}.processing`;
 const LOCAL_SERVERS_PATH = path.join(__dirname, "local_servers.json");
-const LOCAL_SERVERS_WINDOW_MS = 5000;
+const LOCAL_SERVERS_WINDOW_MS = 3000;
 const LOCAL_POLL_MS = 1000;
 const IP_LIKE_RE = /^\d+(?:\.\d+)+$/;
 
@@ -222,13 +222,21 @@ function getAllPending() {
   return pending;
 }
 
-function updateServerUsage(ip, endpointPath) {
+function updateServerUsage(ip, endpointPath, source) {
   const now = Date.now();
   const endpointKey = endpointPath || "";
   if (!serverUsage.has(ip)) {
     serverUsage.set(ip, new Map());
   }
-  serverUsage.get(ip).set(endpointKey, now);
+  const endpoints = serverUsage.get(ip);
+  const entry = endpoints.get(endpointKey) || { lastServer: 0, lastSend: 0 };
+  if (source === "server") {
+    entry.lastServer = now;
+  }
+  if (source === "send") {
+    entry.lastSend = now;
+  }
+  endpoints.set(endpointKey, entry);
 }
 
 function writeLocalServers() {
@@ -242,9 +250,14 @@ function writeLocalServers() {
 
   for (const [ip, endpoints] of serverUsage.entries()) {
     const filtered = [];
-    for (const [endpoint, lastSeen] of endpoints.entries()) {
-      if (lastSeen >= cutoff) {
-        filtered.push({ endpoint: endpoint || null, lastSeen });
+    for (const [endpoint, entry] of endpoints.entries()) {
+      if (entry.lastServer >= cutoff) {
+        filtered.push({
+          endpoint: endpoint || null,
+          lastSeen: entry.lastServer,
+          lastServer: entry.lastServer,
+          lastSend: entry.lastSend || null,
+        });
       } else {
         endpoints.delete(endpoint);
       }
@@ -392,6 +405,8 @@ const server = http.createServer(async (req, res) => {
     const endpointPath = pathParts.slice(2).join("/");
     const list = getListForKey(ip, endpointPath);
     const query = searchParamsToObject(url.searchParams);
+    updateServerUsage(ip, endpointPath, "send");
+    writeLocalServers();
     if (req.method === "POST") {
       try {
         const data = await parseBody(req);
@@ -456,7 +471,7 @@ const server = http.createServer(async (req, res) => {
 
     const endpointPath = pathParts.slice(2).join("/");
     const list = getListForKey(ip, endpointPath);
-    updateServerUsage(ip, endpointPath);
+    updateServerUsage(ip, endpointPath, "server");
     writeLocalServers();
 
     if (req.method === "GET") {
