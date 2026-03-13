@@ -5,7 +5,8 @@ run locally or on Render with zero external dependencies.
 
 ## What it does
 - `POST /send/{ip-like}` stores a request under that ip-like value.
-- `GET /send/{ip-like}` returns all stored requests for that ip-like value.
+- `GET /send/{ip-like}` stores a request under that ip-like value.
+- `GET /send/{ip-like}/list` returns all stored requests for that ip-like value.
 - `GET /server/{ip-like}` returns only pending (unresponded) requests.
 - `POST /server/{ip-like}` marks a request as responded and stores a response.
 
@@ -19,6 +20,7 @@ An "ip-like" value is any string of digits separated by dots, such as
 node server.js
 ```
 3. The server listens on `http://localhost:3000` by default.
+4. On Windows, you can run `run.bat` to force port 3000 (it will stop any process already listening on 3000).
 
 ## Deploy on Render
 1. Create a new Web Service.
@@ -43,11 +45,11 @@ If no response arrives within the wait timeout, the request returns:
 ```
 
 ### GET /send/{ip-like}
-Two modes:
-- With no query string: returns all requests for that ip-like value, including responses.
-- With a query string: **acts like a send request** and waits for a server response.
+Acts like a send request and **waits until the server replies**, just like `POST /send/{ip-like}`.
+The query string (if provided) is stored on the request entry.
 
-When used as a send request, the query string is stored on the request entry.
+### GET /send/{ip-like}/list
+Returns all requests for that ip-like value, including responses.
 - Response:
 ```json
 {
@@ -115,7 +117,7 @@ curl -X POST http://localhost:3000/server/1.2.3.4 \
   -H "Content-Type: application/json" \
   -d "{\"id\":\"YOUR_ID\",\"response\":\"got it\"}"
 
-curl http://localhost:3000/send/1.2.3.4
+curl http://localhost:3000/send/1.2.3.4/list
 ```
 
 ## Notes and limits
@@ -123,3 +125,4 @@ curl http://localhost:3000/send/1.2.3.4
 - Maximum request body size is 1 MB.
 - CORS is enabled for all origins.
 - `POST /send/{ip-like}` will wait up to `WAIT_TIMEOUT_MS` (default: 60000).
+- Set `FORCE_PORT_3000=1` to force port 3000 even if `PORT` is set.
