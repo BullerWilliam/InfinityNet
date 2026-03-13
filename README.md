@@ -6,12 +6,14 @@ run locally or on Render with zero external dependencies.
 ## What it does
 - `POST /send/{ip-like}` stores a request under that ip-like value.
 - `GET /send/{ip-like}` stores a request under that ip-like value.
-- `GET /send/{ip-like}/list` returns all stored requests for that ip-like value.
 - `GET /server/{ip-like}` returns only pending (unresponded) requests.
 - `POST /server/{ip-like}` marks a request as responded and stores a response.
 
 An "ip-like" value is any string of digits separated by dots, such as
 `1.2.3.4` or `10.99.3.7`.
+
+You can also use custom subpaths after the ip-like value, for example:
+`/send/1.2.3.4/chat/main` and `/server/1.2.3.4/chat/main`.
 
 ## Quick start (local)
 1. Ensure Node.js 18+ is installed.
@@ -47,28 +49,6 @@ If no response arrives within the wait timeout, the request returns:
 ### GET /send/{ip-like}
 Acts like a send request and **waits until the server replies**, just like `POST /send/{ip-like}`.
 The query string (if provided) is stored on the request entry.
-
-### GET /send/{ip-like}/list
-Returns all requests for that ip-like value, including responses.
-- Response:
-```json
-{
-  "ok": true,
-  "ip": "1.2.3.4",
-  "requests": [
-    {
-      "id": "request-id",
-      "method": "POST",
-      "data": { "message": "hello" },
-      "query": { "source": "web" },
-      "receivedAt": "2026-03-13T18:00:00.000Z",
-      "responded": true,
-      "response": "got it",
-      "respondedAt": "2026-03-13T18:02:00.000Z"
-    }
-  ]
-}
-```
 
 ### GET /server/{ip-like}
 Returns only pending (not yet responded) requests.
@@ -116,8 +96,6 @@ curl http://localhost:3000/server/1.2.3.4
 curl -X POST http://localhost:3000/server/1.2.3.4 \
   -H "Content-Type: application/json" \
   -d "{\"id\":\"YOUR_ID\",\"response\":\"got it\"}"
-
-curl http://localhost:3000/send/1.2.3.4/list
 ```
 
 ## Notes and limits
