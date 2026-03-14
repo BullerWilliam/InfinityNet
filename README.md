@@ -1,19 +1,22 @@
 # InfinityNet
-InfinityNet is a tiny Node.js HTTP server that lets you send requests to a
-custom "ip-like" address and later reply to those requests. It is designed to
-run locally or on Render with zero external dependencies.
+InfinityNet is a tiny Node.js HTTP server that lets you send requests using
+server names (like `github.com`) and later reply to those requests using the
+server IP. It is designed to run locally or on Render with zero external
+dependencies.
 
 ## What it does
-- `POST /send/{ip-like}` stores a request under that ip-like value.
-- `GET /send/{ip-like}` stores a request under that ip-like value.
-- `GET /server/{ip-like}` returns only pending (unresponded) requests.
-- `POST /server/{ip-like}` marks a request as responded and stores a response.
+- `POST /serversettings/{ip}` sets a server name for an IP (example: `github.com`).
+- `GET /serversettings/{ip}` reads the current settings for that IP.
+- `POST /send/{server-name}` stores a request under the matching IP and waits for a response.
+- `GET /send/{server-name}` stores a request under the matching IP and waits for a response.
+- `GET /server/{ip}` returns only pending (unresponded) requests.
+- `POST /server/{ip}` marks a request as responded and stores a response.
 
 An "ip-like" value is any string of digits separated by dots, such as
-`1.2.3.4` or `10.99.3.7`.
+`1.2.3.4` or `10.99.3.7`. IPs are used only on `/server` and `/serversettings`.
 
-You can also use custom subpaths after the ip-like value, for example:
-`/send/1.2.3.4/chat/main` and `/server/1.2.3.4/chat/main`.
+You can also use custom subpaths after the server name or IP value, for example:
+`/send/github.com/chat/main` and `/server/1.2.3.4/chat/main`.
 
 ## Quick start (local)
 1. Ensure Node.js 18+ is installed.
@@ -33,7 +36,25 @@ node server.js
 4. Render will set `PORT` automatically. The server reads `process.env.PORT`.
 
 ## Endpoint details
-### POST /send/{ip-like}
+### POST /serversettings/{ip}
+Sets the server name and description for an IP.
+- Body: JSON or plain text containing `ServerName` and/or `Description`
+```json
+{ "ServerName": "github.com", "Description": "Main GitHub server" }
+```
+- Response:
+```json
+{ "ok": true, "ip": "1.2.3.4", "settings": { "ServerName": "github.com", "Description": "Main GitHub server" } }
+```
+
+### GET /serversettings/{ip}
+Reads the current settings for an IP.
+- Response:
+```json
+{ "ok": true, "ip": "1.2.3.4", "settings": { "ServerName": "github.com", "Description": "Main GitHub server" } }
+```
+
+### POST /send/{server-name}
 Stores a request and **waits until the server replies** via `POST /server/{ip-like}`.
 - Body: JSON or plain text (anything). If JSON, it is parsed and stored.
 - Query string: supported. Query values are stored alongside the request.
@@ -45,12 +66,16 @@ If no response arrives within the wait timeout, the request returns:
 ```json
 { "ok": false, "id": "request-id", "error": "Response timeout" }
 ```
+If the server name exists but has not been active in the last 5 seconds:
+```json
+{ "ok": false, "error": "server is real but is not working" }
+```
 
-### GET /send/{ip-like}
-Acts like a send request and **waits until the server replies**, just like `POST /send/{ip-like}`.
+### GET /send/{server-name}
+Acts like a send request and **waits until the server replies**, just like `POST /send/{server-name}`.
 The query string (if provided) is stored on the request entry.
 
-### GET /server/{ip-like}
+### GET /server/{ip}
 Returns only pending (not yet responded) requests.
 - Response:
 ```json
@@ -72,7 +97,7 @@ Returns only pending (not yet responded) requests.
 }
 ```
 
-### POST /server/{ip-like}
+### POST /server/{ip}
 Responds to a specific request by id.
 - Body: JSON with `id` and `response`
 ```json
@@ -85,11 +110,17 @@ Responds to a specific request by id.
 
 ## Example requests
 ```bash
-curl -X POST http://localhost:3000/send/1.2.3.4 \
+# Set server name
+curl -X POST http://localhost:3000/serversettings/1.2.3.4 \
+  -H "Content-Type: application/json" \
+  -d "{\"ServerName\":\"github.com\",\"Description\":\"Main GitHub server\"}"
+
+# Send using server name (not IP)
+curl -X POST http://localhost:3000/send/github.com/echo \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"hello\"}"
 
-curl "http://localhost:3000/send/1.2.3.4?source=web&user=tim"
+curl "http://localhost:3000/send/github.com/echo?source=web&user=tim"
 
 curl http://localhost:3000/server/1.2.3.4
 
@@ -102,5 +133,6 @@ curl -X POST http://localhost:3000/server/1.2.3.4 \
 - All data is stored in memory. It resets whenever the server restarts.
 - Maximum request body size is 1 MB.
 - CORS is enabled for all origins.
-- `POST /send/{ip-like}` will wait up to `WAIT_TIMEOUT_MS` (default: 60000).
+- `POST /send/{server-name}` will wait up to `WAIT_TIMEOUT_MS` (default: 30000).
 - Set `FORCE_PORT_3000=1` to force port 3000 even if `PORT` is set.
+- Server activity is tracked for 5 seconds to determine if `/send` is allowed.

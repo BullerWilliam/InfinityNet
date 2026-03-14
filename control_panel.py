@@ -22,7 +22,8 @@ LOG_TOP_Y = 176
 LOG_BOTTOM_MARGIN = 24
 PENDING_REFRESH_SEC = 0.8
 SERVERS_REFRESH_SEC = 0.8
-SERVERS_WINDOW_MS = 3000
+ENDPOINT_REFRESH_SEC = 0.8
+SERVERS_WINDOW_MS = 5000
 BLINK_PULSE_MS = 500
 
 COLORS = {
@@ -169,6 +170,16 @@ def read_local_servers(path):
     except Exception as err:
         return [], None, str(err)
 
+def read_local_endpoint_stats(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data.get("endpoints", []), data.get("updatedAt"), None
+    except FileNotFoundError:
+        return [], None, None
+    except Exception as err:
+        return [], None, str(err)
+
 def clear_local_servers(path):
     payload = {
         "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -199,21 +210,161 @@ def latest_last_seen(servers_list):
                 latest = last_seen if latest is None else max(latest, last_seen)
     return latest
 
+def wrap_text(text, font, max_width):
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if font.size(trial)[0] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+def normalize_site_input(text):
+    return text.strip().lower().rstrip(".")
+
+def normalize_endpoint_input(text):
+    return text.strip().strip("/")
+
+def build_endpoint_info_lines(endpoints, site_input, endpoint_input):
+    site = normalize_site_input(site_input)
+    endpoint_raw = endpoint_input.strip()
+    endpoint = normalize_endpoint_input(endpoint_input)
+    lines = []
+
+    if not site or endpoint_raw == "":
+        lines.append("Enter a site name and endpoint to view stats.")
+        return lines
+
+    match = None
+    for item in endpoints:
+        server_name = item.get("serverName") or ""
+        item_site = normalize_site_input(server_name)
+        item_endpoint = normalize_endpoint_input(item.get("endpoint") or "")
+        if item_site == site and item_endpoint == endpoint:
+            match = item
+            break
+
+    if not match:
+        lines.append("No data recorded for this site and endpoint yet.")
+        return lines
+
+    total_requests = match.get("totalRequests", 0) or 0
+    method_counts = match.get("methodCounts") or {}
+    get_count = method_counts.get("GET", 0) or 0
+    post_count = method_counts.get("POST", 0) or 0
+    total_responses = match.get("totalResponses", 0) or 0
+    avg_delay = match.get("avgResponseDelayMs")
+    last_delay = match.get("lastResponseDelayMs")
+    last_request_at = match.get("lastRequestAt") or "-"
+    last_response_at = match.get("lastResponseAt") or "-"
+
+    response_rate = 0.0
+    if total_requests > 0:
+        response_rate = (total_responses / total_requests) * 100.0
+
+    lines.append(f"Site: {site}")
+    display_endpoint = "/" if endpoint == "" else f"/{endpoint}"
+    lines.append(f"Endpoint: {display_endpoint}")
+    lines.append(f"Total requests: {total_requests}")
+    lines.append(f"Methods: GET {get_count} | POST {post_count}")
+    lines.append(f"Responses: {total_responses} ({response_rate:.1f}%)")
+    lines.append(f"Last request: {last_request_at}")
+    lines.append(f"Last response: {last_response_at}")
+    if avg_delay is None:
+        lines.append("Avg response delay: -")
+    else:
+        lines.append(f"Avg response delay: {int(avg_delay)} ms")
+    if last_delay is None:
+        lines.append("Last response delay: -")
+    else:
+        lines.append(f"Last response delay: {int(last_delay)} ms")
+
+    lines.append("")
+    lines.append("Queries:")
+    queries = match.get("queries") or []
+    if not queries:
+        lines.append("  (no queries recorded)")
+        return lines
+
+    sorted_queries = sorted(queries, key=lambda q: q.get("count", 0), reverse=True)
+    for query in sorted_queries:
+        count = query.get("count", 0) or 0
+        percent = (count / total_requests * 100.0) if total_requests > 0 else 0.0
+        label = query.get("query") or "(no query)"
+        display_label = "(no query)"
+        if label != "(no query)":
+            keys = []
+            for part in label.split("&"):
+                key = part.split("=", 1)[0].strip()
+                if key and key not in keys:
+                    keys.append(key)
+            display_label = ", ".join(keys) if keys else "(no query)"
+        lines.append(f"  {display_label} — {count} ({percent:.1f}%)")
+
+    return lines
+
+def estimate_server_rows(servers_rows, font, max_width):
+    total = 0
+    for row in servers_rows:
+        if row.get("type") == "desc":
+            lines = wrap_text(row.get("text", ""), font, max_width)
+            total += max(1, len(lines))
+        else:
+            total += 1
+    return total
+
 def build_endpoint_tree(endpoints):
-    root = {"children": {}, "lastSend": 0, "isEndpoint": False}
+    root = {
+        "children": {},
+        "lastSend": 0,
+        "isEndpoint": False,
+        "delayMs": None,
+        "sumDelay": 0,
+        "countDelay": 0,
+    }
     for endpoint in endpoints:
         path = endpoint.get("endpoint") or ""
         last_send = endpoint.get("lastSend") or 0
+        last_delay = endpoint.get("lastDelayMs")
         parts = [part for part in path.split("/") if part]
         if not parts:
             parts = ["(root)"]
         node = root
         for part in parts:
             if part not in node["children"]:
-                node["children"][part] = {"children": {}, "lastSend": 0, "isEndpoint": False}
+                node["children"][part] = {
+                    "children": {},
+                    "lastSend": 0,
+                    "isEndpoint": False,
+                    "delayMs": None,
+                    "sumDelay": 0,
+                    "countDelay": 0,
+                }
             node = node["children"][part]
         node["lastSend"] = max(node["lastSend"], last_send)
         node["isEndpoint"] = True
+        if isinstance(last_delay, (int, float)):
+            if node["delayMs"] is None:
+                node["delayMs"] = last_delay
+            else:
+                node["delayMs"] = max(node["delayMs"], last_delay)
+            node["sumDelay"] += last_delay
+            node["countDelay"] += 1
+    def aggregate(node):
+        for child in node["children"].values():
+            aggregate(child)
+            node["sumDelay"] += child.get("sumDelay", 0)
+            node["countDelay"] += child.get("countDelay", 0)
+        return node
+
+    aggregate(root)
     return root
 
 def flatten_endpoint_tree(node, depth, rows, prefix, ip):
@@ -221,6 +372,9 @@ def flatten_endpoint_tree(node, depth, rows, prefix, ip):
         child = node["children"][name]
         has_children = len(child["children"]) > 0
         full_path = name if not prefix else f"{prefix}/{name}"
+        avg_delay = None
+        if child.get("countDelay", 0) > 0:
+            avg_delay = child["sumDelay"] / child["countDelay"]
         rows.append(
             {
                 "type": "node",
@@ -229,6 +383,8 @@ def flatten_endpoint_tree(node, depth, rows, prefix, ip):
                 "path": full_path,
                 "ip": ip,
                 "lastSend": child.get("lastSend", 0),
+                "delayMs": child.get("delayMs", None),
+                "avgDelayMs": avg_delay,
                 "isEndpoint": child.get("isEndpoint", False),
                 "hasChildren": has_children,
             }
@@ -239,7 +395,25 @@ def build_server_rows(servers_items, servers_expanded):
     rows = []
     for server in servers_items:
         ip = server.get("ip", "-")
-        rows.append({"type": "ip", "ip": ip, "text": f"IP: {ip}"})
+        name = server.get("serverName") if isinstance(server.get("serverName"), str) else "Unknown"
+        label = f"{name} ({ip})"
+        rows.append(
+            {
+                "type": "ip",
+                "ip": ip,
+                "text": label,
+                "active": bool(server.get("active", False)),
+            }
+        )
+        description = server.get("description")
+        if isinstance(description, str) and description.strip():
+            rows.append(
+                {
+                    "type": "desc",
+                    "ip": ip,
+                    "text": description.strip(),
+                }
+            )
         if not servers_expanded.get(ip, True):
             continue
         endpoints = server.get("endpoints", [])
@@ -312,6 +486,15 @@ def main():
     servers_blink_until = {}
     servers_expanded = {}
     servers_header_rects = []
+    endpoint_items = []
+    endpoint_last_update = None
+    endpoint_error = None
+    last_endpoint_fetch = 0.0
+    endpoint_scroll_offset = 0
+    endpoint_info_site = ""
+    endpoint_info_endpoint = ""
+    endpoint_active_field = None
+    endpoint_lines = []
 
     process = None
     running_port = None
@@ -319,6 +502,7 @@ def main():
     local_pending_path = os.path.join(project_dir, "local_pending.json")
     local_cancel_path = os.path.join(project_dir, "local_cancel.jsonl")
     local_servers_path = os.path.join(project_dir, "local_servers.json")
+    local_endpoint_stats_path = os.path.join(project_dir, "local_endpoint_stats.json")
 
     port_input = DEFAULT_PORT
     port_active = False
@@ -353,8 +537,13 @@ def main():
         "Servers",
         {"bg": (40, 50, 62), "border": COLORS["panel_border"], "text": COLORS["text"]},
     )
+    endpoint_tab = Button(
+        (SIDE_MARGIN + 370, TAB_ROW_Y, 160, 28),
+        "Endpoint Info",
+        {"bg": (40, 50, 62), "border": COLORS["panel_border"], "text": COLORS["text"]},
+    )
     bottom_button = Button(
-        (SIDE_MARGIN + 370, TAB_ROW_Y, 120, 28),
+        (SIDE_MARGIN + 570, TAB_ROW_Y, 120, 28),
         "Bottom",
         {"bg": COLORS["accent_blue"], "border": (40, 120, 180), "text": COLORS["text"]},
     )
@@ -396,6 +585,22 @@ def main():
     running = True
     while running:
         visible_lines = max(1, (log_area.height - 32) // LOG_LINE_HEIGHT)
+        endpoint_content_top = log_area.y + 140
+        endpoint_visible_lines = max(
+            1, (log_area.bottom - endpoint_content_top - 8) // LOG_LINE_HEIGHT
+        )
+        endpoint_site_rect = pygame.Rect(
+            log_area.x + LOG_PADDING,
+            log_area.y + 70,
+            log_area.width - LOG_PADDING * 2,
+            32,
+        )
+        endpoint_endpoint_rect = pygame.Rect(
+            log_area.x + LOG_PADDING,
+            log_area.y + 110,
+            log_area.width - LOG_PADDING * 2,
+            32,
+        )
         pending_cancel_rects = []
         flush_logs()
         max_log_offset = max(0, len(log_lines) - visible_lines)
@@ -438,9 +643,25 @@ def main():
                     if ip and ip not in servers_expanded:
                         servers_expanded[ip] = True
             servers_rows = build_server_rows(servers_items, servers_expanded)
-            servers_total_rows = len(servers_rows)
+            desc_width = log_area.width - LOG_PADDING * 2 - 30
+            servers_total_rows = estimate_server_rows(servers_rows, ui_font, desc_width)
             max_servers_offset = max(0, servers_total_rows - visible_lines)
             servers_scroll_offset = max(0, min(servers_scroll_offset, max_servers_offset))
+
+        if active_tab == "endpoint":
+            now = time.time()
+            if now - last_endpoint_fetch > ENDPOINT_REFRESH_SEC:
+                last_endpoint_fetch = now
+                endpoint_items, endpoint_last_update, endpoint_error = read_local_endpoint_stats(
+                    local_endpoint_stats_path
+                )
+            endpoint_lines = build_endpoint_info_lines(
+                endpoint_items, endpoint_info_site, endpoint_info_endpoint
+            )
+            max_endpoint_offset = max(0, len(endpoint_lines) - endpoint_visible_lines)
+            endpoint_scroll_offset = max(
+                0, min(endpoint_scroll_offset, max_endpoint_offset)
+            )
 
         if process and process.poll() is not None:
             log_queue.put(
@@ -473,6 +694,15 @@ def main():
                     port_active = True
                 else:
                     port_active = False
+                if active_tab == "endpoint":
+                    if endpoint_site_rect.collidepoint(event.pos):
+                        endpoint_active_field = "site"
+                    elif endpoint_endpoint_rect.collidepoint(event.pos):
+                        endpoint_active_field = "endpoint"
+                    else:
+                        endpoint_active_field = None
+                else:
+                    endpoint_active_field = None
 
                 if toggle_button.hit(event.pos):
                     if process and process.poll() is None:
@@ -540,6 +770,14 @@ def main():
                         servers_empty_streak = 0
                         servers_rows = build_server_rows(servers_items, servers_expanded)
 
+                if endpoint_tab.hit(event.pos):
+                    active_tab = "endpoint"
+                    endpoint_items, endpoint_last_update, endpoint_error = read_local_endpoint_stats(
+                        local_endpoint_stats_path
+                    )
+                    last_endpoint_fetch = time.time()
+                    endpoint_scroll_offset = 0
+
                 if active_tab == "logs" and not log_follow and bottom_button.hit(event.pos):
                     log_follow = True
                     log_scroll_offset = 0
@@ -564,6 +802,30 @@ def main():
                 else:
                     if event.unicode.isdigit() and len(port_input) < 5:
                         port_input += event.unicode
+            elif event.type == pygame.KEYDOWN and active_tab == "endpoint" and endpoint_active_field:
+                if event.key == pygame.K_RETURN:
+                    endpoint_active_field = None
+                elif event.key == pygame.K_TAB:
+                    endpoint_active_field = (
+                        "endpoint" if endpoint_active_field == "site" else "site"
+                    )
+                elif event.key == pygame.K_BACKSPACE:
+                    if endpoint_active_field == "site":
+                        endpoint_info_site = endpoint_info_site[:-1]
+                    else:
+                        endpoint_info_endpoint = endpoint_info_endpoint[:-1]
+                    endpoint_scroll_offset = 0
+                else:
+                    if event.unicode and len(event.unicode) == 1 and ord(event.unicode) >= 32:
+                        if endpoint_active_field == "site" and len(endpoint_info_site) < 120:
+                            endpoint_info_site += event.unicode
+                            endpoint_scroll_offset = 0
+                        elif (
+                            endpoint_active_field == "endpoint"
+                            and len(endpoint_info_endpoint) < 160
+                        ):
+                            endpoint_info_endpoint += event.unicode
+                            endpoint_scroll_offset = 0
 
             if event.type == pygame.MOUSEWHEEL:
                 if active_tab == "logs":
@@ -576,9 +838,18 @@ def main():
                     max_offset = max(0, len(pending_items) - visible_lines)
                     pending_scroll_offset = max(0, min(pending_scroll_offset, max_offset))
                 else:
-                    servers_scroll_offset += event.y
-                    max_offset = max(0, servers_total_rows - visible_lines)
-                    servers_scroll_offset = max(0, min(servers_scroll_offset, max_offset))
+                    if active_tab == "servers":
+                        servers_scroll_offset += event.y
+                        max_offset = max(0, servers_total_rows - visible_lines)
+                        servers_scroll_offset = max(
+                            0, min(servers_scroll_offset, max_offset)
+                        )
+                    elif active_tab == "endpoint":
+                        endpoint_scroll_offset += event.y
+                        max_offset = max(0, len(endpoint_lines) - endpoint_visible_lines)
+                        endpoint_scroll_offset = max(
+                            0, min(endpoint_scroll_offset, max_offset)
+                        )
 
         draw_vertical_gradient(
             screen,
@@ -643,6 +914,13 @@ def main():
             True,
             active=active_tab == "servers",
             hovered=servers_tab.hit(mouse_pos),
+        )
+        endpoint_tab.draw(
+            screen,
+            ui_font,
+            True,
+            active=active_tab == "endpoint",
+            hovered=endpoint_tab.hit(mouse_pos),
         )
         if active_tab == "logs" and not log_follow:
             bottom_button.draw(screen, ui_font, True, hovered=bottom_button.hit(mouse_pos))
@@ -712,8 +990,8 @@ def main():
                 screen.blit(x_text, x_rect)
                 pending_cancel_rects.append((cancel_rect, entry.get("id", "")))
                 y += LOG_LINE_HEIGHT
-        else:
-            servers_title = ui_font.render("Servers (Last 3s)", True, COLORS["text"])
+        elif active_tab == "servers":
+            servers_title = ui_font.render("Servers (Last 5s)", True, COLORS["text"])
             screen.blit(servers_title, (log_area.x + 8, log_area.y + 6))
 
             status_line = "Last update: " + (servers_last_update or "-")
@@ -727,7 +1005,7 @@ def main():
 
             if not servers_items:
                 empty = ui_font.render(
-                    "No server activity in the last 3 seconds.",
+                    "No server activity in the last 5 seconds.",
                     True,
                     COLORS["muted"],
                 )
@@ -765,26 +1043,42 @@ def main():
                         log_area.width - LOG_PADDING * 2 + 4,
                         LOG_LINE_HEIGHT + 6,
                     )
-                    pygame.draw.rect(
-                        screen,
-                        (40, 46, 58),
-                        header_rect,
-                        border_radius=6,
-                    )
-                    pygame.draw.rect(
-                        screen,
-                        (70, 78, 95),
-                        header_rect,
-                        2,
-                        border_radius=6,
-                    )
+                    is_active = item.get("active", False)
+                    header_bg = (40, 46, 58) if is_active else (32, 34, 40)
+                    header_border = (70, 78, 95) if is_active else (80, 60, 60)
+                    pygame.draw.rect(screen, header_bg, header_rect, border_radius=6)
+                    pygame.draw.rect(screen, header_border, header_rect, 2, border_radius=6)
                     caret = "-" if is_open else "+"
                     caret_text = ui_font.render(caret, True, COLORS["muted"])
                     screen.blit(caret_text, (header_rect.x + 6, header_rect.y + 2))
                     ip_text = mono_font.render(item["text"], True, COLORS["accent_purple"])
                     screen.blit(ip_text, (header_rect.x + 22, header_rect.y + 2))
+                    if not is_active:
+                        inactive_text = ui_font.render("inactive", True, COLORS["accent_red"])
+                        inactive_rect = inactive_text.get_rect(
+                            right=header_rect.right - 10, centery=header_rect.centery
+                        )
+                        screen.blit(inactive_text, inactive_rect)
                     servers_header_rects.append((header_rect, item["ip"]))
                     y += LOG_LINE_HEIGHT + 4
+                elif item["type"] == "desc":
+                    desc_width = log_area.width - LOG_PADDING * 2 - 30
+                    lines = wrap_text(item["text"], ui_font, desc_width - 16)
+                    box_height = max(1, len(lines)) * LOG_LINE_HEIGHT + 6
+                    desc_rect = pygame.Rect(
+                        log_area.x + LOG_PADDING + 18,
+                        y - 2,
+                        desc_width,
+                        box_height,
+                    )
+                    pygame.draw.rect(screen, (28, 34, 44), desc_rect, border_radius=6)
+                    pygame.draw.rect(screen, (50, 60, 78), desc_rect, 1, border_radius=6)
+                    text_y = desc_rect.y + 4
+                    for line in lines:
+                        desc_text = ui_font.render(line, True, COLORS["muted"])
+                        screen.blit(desc_text, (desc_rect.x + 8, text_y))
+                        text_y += LOG_LINE_HEIGHT
+                    y += box_height + 4
                 else:
                     indent = 18 * item["depth"]
                     pill_rect = pygame.Rect(
@@ -817,9 +1111,67 @@ def main():
                         1,
                         border_radius=6,
                     )
-                    ep_text = mono_font.render(item["text"], True, text_color)
+                    label = item["text"]
+                    if item.get("hasChildren") and item.get("avgDelayMs") is not None:
+                        label = f"{label} ({int(item['avgDelayMs'])} ms avg)"
+                    elif not item.get("hasChildren") and item.get("delayMs") is not None:
+                        label = f"{label} ({int(item['delayMs'])} ms)"
+                    ep_text = mono_font.render(label, True, text_color)
                     screen.blit(ep_text, (pill_rect.x + 8, pill_rect.y + 2))
                     y += LOG_LINE_HEIGHT + 2
+        else:
+            endpoint_title = ui_font.render("Endpoint Info", True, COLORS["text"])
+            screen.blit(endpoint_title, (log_area.x + 8, log_area.y + 6))
+
+            status_line = "Last update: " + (endpoint_last_update or "-")
+            status_color = (160, 200, 160) if endpoint_last_update else COLORS["muted"]
+            status = ui_font.render(status_line, True, status_color)
+            screen.blit(status, (log_area.x + LOG_PADDING, log_area.y + 32))
+
+            if endpoint_error:
+                err = ui_font.render(f"Error: {endpoint_error}", True, COLORS["accent_red"])
+                screen.blit(err, (log_area.x + LOG_PADDING, log_area.y + 52))
+
+            site_label = ui_font.render("Site name", True, COLORS["muted"])
+            screen.blit(site_label, (endpoint_site_rect.x, endpoint_site_rect.y - 18))
+            endpoint_label = ui_font.render("Endpoint", True, COLORS["muted"])
+            screen.blit(
+                endpoint_label, (endpoint_endpoint_rect.x, endpoint_endpoint_rect.y - 18)
+            )
+
+            def draw_input(rect, value, is_active):
+                bg = (38, 44, 54) if is_active else (30, 34, 42)
+                border = COLORS["accent_blue"] if is_active else COLORS["panel_border"]
+                pygame.draw.rect(screen, bg, rect, border_radius=6)
+                pygame.draw.rect(screen, border, rect, 2, border_radius=6)
+                text_surface = mono_font.render(value, True, COLORS["text"])
+                screen.blit(text_surface, (rect.x + 8, rect.y + 7))
+
+            draw_input(endpoint_site_rect, endpoint_info_site, endpoint_active_field == "site")
+            draw_input(
+                endpoint_endpoint_rect,
+                endpoint_info_endpoint,
+                endpoint_active_field == "endpoint",
+            )
+
+            y = endpoint_content_top
+            start_index = max(
+                0, len(endpoint_lines) - endpoint_visible_lines - endpoint_scroll_offset
+            )
+            visible = endpoint_lines[start_index : start_index + endpoint_visible_lines]
+            for line in visible:
+                color = COLORS["text"]
+                if line.startswith("No data") or line.startswith("Enter"):
+                    color = COLORS["muted"]
+                elif line.startswith("Queries"):
+                    color = COLORS["accent_blue"]
+                elif line.startswith("Site:") or line.startswith("Endpoint:"):
+                    color = COLORS["accent_purple"]
+                elif line.startswith("Responses:") and "0 (" in line:
+                    color = COLORS["accent_orange"]
+                text_surf = mono_font.render(line, True, color)
+                screen.blit(text_surf, (log_area.x + LOG_PADDING, y))
+                y += LOG_LINE_HEIGHT
 
         pygame.display.flip()
         clock.tick(60)
