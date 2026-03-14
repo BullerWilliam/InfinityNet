@@ -1,1 +1,1 @@
-{"updatedAt":"2026-03-14T11:22:44.386Z","windowMs":5000,"servers":[{"ip":"4.3.2.1","serverName":"github.com","description":"This is a github copy","active":false,"lastServerAt":1773487310890,"endpoints":[{"endpoint":"api","lastSeen":1773487300900,"lastServer":1773487300900,"lastSend":1773487250538,"lastDelayMs":2354},{"endpoint":null,"lastSeen":1773487310890,"lastServer":1773487310890,"lastSend":1773487241713,"lastDelayMs":1167}]}]}
+{"updatedAt": "2026-03-14T12:50:30Z", "windowMs": 5000, "servers": []}
